@@ -12,13 +12,14 @@ anchor keys sync
 # compile the program
 anchor build
 
-# Copy program type and IDL to app/src/idl/counter.ts
+# Copy program type and IDL to app/src/idl/
 
-# type is at target/types/counter.ts
-# IDL is at target/idl/counter.json
+# type is at target/types/flappy_bird.ts
+# IDL is at target/idl/flappy_bird.json
 
 # copy type
-cp "$PROJECT_ROOT/target/types/counter.ts" "$PROJECT_ROOT/app/src/idl/counter.ts"
+cp "$PROJECT_ROOT/target/types/flappy_bird.ts" "$PROJECT_ROOT/app/src/idl/flappy_bird.ts"
 
 # copy IDL
-cp "$PROJECT_ROOT/target/idl/counter.json" "$PROJECT_ROOT/app/src/idl/counter.json"
+cp "$PROJECT_ROOT/target/idl/flappy_bird.json" "$PROJECT_ROOT/app/src/idl/flappy_bird.json"
+

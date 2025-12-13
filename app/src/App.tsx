@@ -1,25 +1,30 @@
 import { WalletMultiButton } from "@solana/wallet-adapter-react-ui";
-import { Counter } from "./components/Counter";
+import { FlappyBird } from "./components/FlappyBird";
 import "./index.css";
 
 export function App() {
   return (
     <>
-      <div className="absolute top-5 right-5">
+      <div className="absolute top-5 right-5 flex gap-2 items-center z-50">
         <WalletMultiButton />
       </div>
-      <div className="bg-gray-50 p-8 rounded-xl border">
-        <div className="max-w-2xl mx-auto">
-          <header className="text-center mb-8">
-            <h1 className="text-3xl font-bold mb-2">Magicblock Anchor Counter</h1>
+      <div className="bg-gray-50 min-h-screen">
+        <div className="max-w-7xl mx-auto ">
+          <header className="text-center mb-4">
+            <h1 className="text-2xl font-bold mb-1">
+              {/* On-Chain Flappy Bird */}
+            </h1>
+            <p className="text-gray-500 text-sm">
+              {/* Fully on-chain game powered by MagicBlock Ephemeral Rollups */}
+            </p>
           </header>
 
-          <main>
-            <Counter />
+          <main className="flex justify-center">
+            <FlappyBird />
           </main>
 
-          <footer className="text-center mt-8 text-gray-500 text-sm">
-            <p>Magicblock + Anchor + Solana</p>
+          <footer className="text-center mt-4 text-gray-500 text-sm">
+            <p>MagicBlock • Anchor • Solana • Low Latency</p>
           </footer>
         </div>
       </div>

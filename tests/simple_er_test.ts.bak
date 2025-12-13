@@ -1,0 +1,157 @@
+import * as anchor from "@coral-xyz/anchor";
+import { Program, web3 } from "@coral-xyz/anchor";
+import { Connection, PublicKey, Keypair } from "@solana/web3.js";
+import { FlappyBird } from "../target/types/flappy_bird";
+
+const DELEGATION_PROGRAM_ID = new PublicKey("DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh");
+
+describe("Simple ER Test - Start Game", () => {
+    const provider = anchor.AnchorProvider.env();
+    anchor.setProvider(provider);
+
+    // Ephemeral Rollup endpoints
+    const ER_ENDPOINT = "https://devnet.magicblock.app";
+    const ER_WS_ENDPOINT = "wss://devnet.magicblock.app/";
+
+    const erConnection = new Connection(ER_ENDPOINT, {
+        wsEndpoint: ER_WS_ENDPOINT,
+        commitment: "confirmed",
+    });
+    
+    const providerEphemeralRollup = new anchor.AnchorProvider(
+        erConnection,
+        anchor.Wallet.local(),
+        { commitment: "confirmed" }
+    );
+
+    console.log("═══════════════════════════════════════════════════════════════");
+    console.log("Simple ER Test");
+    console.log("  Base Layer:      ", provider.connection.rpcEndpoint);
+    console.log("  Ephemeral Rollup:", ER_ENDPOINT);
+    console.log("  Wallet:          ", anchor.Wallet.local().publicKey.toString());
+    console.log("═══════════════════════════════════════════════════════════════\n");
+
+    const program = anchor.workspace.FlappyBird as Program<FlappyBird>;
+    const authority = provider.wallet;
+
+    // Game seed for PDA derivation - must match program
+    const GAME_SEED = Buffer.from("game_v2");
+
+    // Derive PDA
+    const [gamePDA] = anchor.web3.PublicKey.findProgramAddressSync(
+        [GAME_SEED, authority.publicKey.toBuffer()],
+        program.programId
+    );
+
+    console.log("Program ID: ", program.programId.toString());
+    console.log("Game PDA:   ", gamePDA.toString());
+
+    /**
+     * Send transaction to Ephemeral Rollup
+     */
+    const sendERTransaction = async (tx: anchor.web3.Transaction): Promise<string> => {
+        tx.feePayer = providerEphemeralRollup.wallet.publicKey;
+        tx.recentBlockhash = (await providerEphemeralRollup.connection.getLatestBlockhash()).blockhash;
+        tx = await providerEphemeralRollup.wallet.signTransaction(tx);
+        
+        const txHash = await providerEphemeralRollup.connection.sendRawTransaction(
+            tx.serialize(),
+            { skipPreflight: true }
+        );
+        await providerEphemeralRollup.connection.confirmTransaction(txHash, "confirmed");
+        return txHash;
+    };
+
+    it("1. Check delegation status", async function () {
+        this.timeout(30000);
+        
+        const accountInfo = await provider.connection.getAccountInfo(gamePDA);
+        
+        if (!accountInfo) {
+            console.log("  ❌ Account not found - need to initialize first");
+            throw new Error("Account not initialized");
+        }
+        
+        const isDelegated = accountInfo.owner.equals(DELEGATION_PROGRAM_ID);
+        console.log("  Account owner:", accountInfo.owner.toBase58());
+        console.log("  Is delegated:", isDelegated);
+        
+        if (!isDelegated) {
+            console.log("  ℹ️  Need to delegate first");
+            
+            const tx = await program.methods
+                .delegate()
+                .accounts({ payer: authority.publicKey })
+                .transaction();
+
+            const txHash = await provider.sendAndConfirm(tx, [provider.wallet.payer], {
+                skipPreflight: true,
+                commitment: "confirmed",
+            });
+            console.log("  ✓ Delegated:", txHash);
+            
+            // Wait for ER to sync
+            await new Promise(r => setTimeout(r, 3000));
+        }
+    });
+
+    it("2. Start game on ER without session key", async function () {
+        this.timeout(30000);
+        
+        const start = Date.now();
+        console.log("  Starting game WITHOUT session key...");
+        
+        try {
+            let tx = await program.methods
+                .startGame()
+                .accounts({
+                    game: gamePDA,
+                    signer: providerEphemeralRollup.wallet.publicKey,
+                    sessionToken: null,
+                } as any)
+                .transaction();
+
+            const txHash = await sendERTransaction(tx);
+            const latency = Date.now() - start;
+            console.log(`  ✓ Started game in ${latency}ms`);
+            console.log(`    Tx: ${txHash.slice(0, 40)}...`);
+            
+            // Verify
+            const erProgram = new Program<FlappyBird>(
+                program.idl as any,
+                providerEphemeralRollup
+            );
+            const gameState = await erProgram.account.gameState.fetch(gamePDA);
+            console.log("  Game status:", JSON.stringify(gameState.gameStatus));
+        } catch (err) {
+            console.error("  ❌ Failed:", err);
+            throw err;
+        }
+    });
+
+    it("3. Flap on ER without session key", async function () {
+        this.timeout(30000);
+        
+        const start = Date.now();
+        console.log("  Flapping WITHOUT session key...");
+        
+        try {
+            let tx = await program.methods
+                .flap()
+                .accounts({
+                    game: gamePDA,
+                    signer: providerEphemeralRollup.wallet.publicKey,
+                    sessionToken: null,
+                } as any)
+                .transaction();
+
+            const txHash = await sendERTransaction(tx);
+            const latency = Date.now() - start;
+            console.log(`  ✓ Flapped in ${latency}ms`);
+            console.log(`    Tx: ${txHash.slice(0, 40)}...`);
+        } catch (err) {
+            console.error("  ❌ Failed:", err);
+            throw err;
+        }
+    });
+});

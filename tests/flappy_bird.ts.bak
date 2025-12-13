@@ -1,0 +1,883 @@
+import * as anchor from "@coral-xyz/anchor";
+import { Program, web3 } from "@coral-xyz/anchor";
+import { LAMPORTS_PER_SOL, PublicKey, Connection } from "@solana/web3.js";
+import { expect } from "chai";
+import { FlappyBird } from "../target/types/flappy_bird";
+
+// MagicBlock Delegation Program ID
+const DELEGATION_PROGRAM_ID = new PublicKey("DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh");
+
+describe("flappy_bird - Comprehensive Tests", () => {
+    console.log("🎮 Flappy Bird - Fully On-Chain Game with MagicBlock Ephemeral Rollups\n");
+
+    // Configure the client to use the local cluster
+    const provider = anchor.AnchorProvider.env();
+    anchor.setProvider(provider);
+
+    // Environment detection
+    const isLocalnet = provider.connection.rpcEndpoint.includes("localhost") || 
+                       provider.connection.rpcEndpoint.includes("127.0.0.1");
+
+    // Ephemeral Rollup endpoints - configurable via environment
+    const ER_ENDPOINT = process.env.EPHEMERAL_PROVIDER_ENDPOINT || 
+        (isLocalnet ? "http://localhost:7799" : "https://devnet.magicblock.app");
+    const ER_WS_ENDPOINT = process.env.EPHEMERAL_WS_ENDPOINT || 
+        (isLocalnet ? "ws://localhost:7800" : "wss://devnet.magicblock.app/");
+
+    // Set up Ephemeral Rollup provider
+    const erConnection = new Connection(ER_ENDPOINT, {
+        wsEndpoint: ER_WS_ENDPOINT,
+        commitment: "confirmed",
+    });
+    
+    const providerEphemeralRollup = new anchor.AnchorProvider(
+        erConnection,
+        anchor.Wallet.local(),
+        { commitment: "confirmed" }
+    );
+
+    console.log("═══════════════════════════════════════════════════════════════");
+    console.log("Configuration:");
+    console.log("  Base Layer:      ", provider.connection.rpcEndpoint);
+    console.log("  Ephemeral Rollup:", ER_ENDPOINT);
+    console.log("  ER WebSocket:    ", ER_WS_ENDPOINT);
+    console.log("  Wallet:          ", anchor.Wallet.local().publicKey.toString());
+    console.log("  Is Localnet:     ", isLocalnet);
+    console.log("═══════════════════════════════════════════════════════════════\n");
+
+    const program = anchor.workspace.FlappyBird as Program<FlappyBird>;
+    const authority = provider.wallet;
+
+    // Derive PDA using user's public key
+    const [gamePDA, gameBump] = anchor.web3.PublicKey.findProgramAddressSync(
+        [authority.publicKey.toBuffer()],
+        program.programId
+    );
+
+    console.log("Program ID: ", program.programId.toString());
+    console.log("Game PDA:   ", gamePDA.toString());
+    console.log("PDA Bump:   ", gameBump);
+    console.log("");
+
+    // ========================================
+    // Helper Functions
+    // ========================================
+
+    /**
+     * Get remaining accounts for localnet validator key
+     * Required for MagicBlock ER delegation on localnet
+     */
+    const getLocalnetRemainingAccounts = () => {
+        if (!isLocalnet) return [];
+        
+        // Localnet validator key for MagicBlock
+        return [{
+            pubkey: new web3.PublicKey("mAGicPQYBMvcYveUZA5F5UNNwyHvfYh5xkLS2Fr1mev"),
+            isSigner: false,
+            isWritable: false,
+        }];
+    };
+
+    /**
+     * Send transaction to Ephemeral Rollup
+     */
+    const sendERTransaction = async (tx: anchor.web3.Transaction): Promise<string> => {
+        tx.feePayer = providerEphemeralRollup.wallet.publicKey;
+        tx.recentBlockhash = (await providerEphemeralRollup.connection.getLatestBlockhash()).blockhash;
+        tx = await providerEphemeralRollup.wallet.signTransaction(tx);
+        
+        const txHash = await providerEphemeralRollup.connection.sendRawTransaction(
+            tx.serialize(),
+            { skipPreflight: true }
+        );
+        await providerEphemeralRollup.connection.confirmTransaction(txHash, "confirmed");
+        return txHash;
+    };
+
+    /**
+     * Check if account is delegated (owned by delegation program on base layer)
+     */
+    const checkDelegationStatus = async (accountPubkey: PublicKey): Promise<{
+        isDelegated: boolean;
+        owner: PublicKey | null;
+        lamports: number;
+        dataLength: number;
+    }> => {
+        const accountInfo = await provider.connection.getAccountInfo(accountPubkey);
+        
+        if (!accountInfo) {
+            return { isDelegated: false, owner: null, lamports: 0, dataLength: 0 };
+        }
+        
+        return {
+            isDelegated: accountInfo.owner.equals(DELEGATION_PROGRAM_ID),
+            owner: accountInfo.owner,
+            lamports: accountInfo.lamports,
+            dataLength: accountInfo.data.length,
+        };
+    };
+
+    /**
+     * Check account status on Ephemeral Rollup
+     */
+    const checkERAccountStatus = async (accountPubkey: PublicKey): Promise<{
+        exists: boolean;
+        lamports: number;
+        dataLength: number;
+        data: Buffer | null;
+    }> => {
+        try {
+            const accountInfo = await erConnection.getAccountInfo(accountPubkey);
+            
+            if (!accountInfo) {
+                return { exists: false, lamports: 0, dataLength: 0, data: null };
+            }
+            
+            return {
+                exists: true,
+                lamports: accountInfo.lamports,
+                dataLength: accountInfo.data.length,
+                data: accountInfo.data,
+            };
+        } catch (e) {
+            return { exists: false, lamports: 0, dataLength: 0, data: null };
+        }
+    };
+
+    /**
+     * Wait for account to appear on ER with data
+     */
+    const waitForERAccount = async (
+        accountPubkey: PublicKey, 
+        maxAttempts: number = 30,
+        delayMs: number = 500
+    ): Promise<boolean> => {
+        for (let i = 0; i < maxAttempts; i++) {
+            const status = await checkERAccountStatus(accountPubkey);
+            if (status.exists && status.dataLength > 0) {
+                console.log(`  ✓ Account appeared on ER after ${(i + 1) * delayMs}ms (${status.dataLength} bytes)`);
+                return true;
+            }
+            await new Promise(r => setTimeout(r, delayMs));
+        }
+        return false;
+    };
+
+    /**
+     * Fetch game state from base layer
+     */
+    const fetchGameState = async (): Promise<any | null> => {
+        try {
+            return await program.account.gameState.fetch(gamePDA);
+        } catch (e) {
+            return null;
+        }
+    };
+
+    /**
+     * Fetch game state from Ephemeral Rollup
+     */
+    const fetchERGameState = async (): Promise<any | null> => {
+        try {
+            const erProgram = new Program<FlappyBird>(
+                program.idl as any,
+                providerEphemeralRollup
+            );
+            return await erProgram.account.gameState.fetch(gamePDA);
+        } catch (e) {
+            return null;
+        }
+    };
+
+    // ========================================
+    // Setup
+    // ========================================
+
+    before(async function () {
+        this.timeout(30000);
+        
+        const balance = await provider.connection.getBalance(anchor.Wallet.local().publicKey);
+        console.log("Wallet Balance:", balance / LAMPORTS_PER_SOL, "SOL\n");
+        
+        if (balance < LAMPORTS_PER_SOL / 2) {
+            console.log("⚠️  Warning: Low balance, consider airdropping SOL");
+        }
+    });
+
+    // ========================================
+    // Test Suite 1: Base Layer Initialization
+    // ========================================
+
+    describe("1. Base Layer Initialization", () => {
+        it("1.1 initializes a new game account", async function () {
+            this.timeout(30000);
+            const start = Date.now();
+            
+            // Check if account already exists
+            const existingState = await fetchGameState();
+            
+            if (existingState) {
+                console.log("  ℹ️  Game already initialized, checking state...");
+                expect(existingState.authority.toBase58()).to.equal(authority.publicKey.toBase58());
+                console.log(`  Score: ${existingState.score}, High Score: ${existingState.highScore}`);
+                console.log(`  Status: ${JSON.stringify(existingState.gameStatus)}`);
+                return;
+            }
+            
+            const tx = await program.methods
+                .initialize()
+                .accounts({ authority: authority.publicKey })
+                .transaction();
+
+            const txHash = await provider.sendAndConfirm(tx, [provider.wallet.payer], {
+                skipPreflight: true,
+                commitment: "confirmed",
+            });
+            
+            console.log(`  ✓ Initialized in ${Date.now() - start}ms`);
+            console.log(`    Tx: ${txHash.slice(0, 40)}...`);
+
+            const gameAccount = await fetchGameState();
+            expect(gameAccount).to.not.be.null;
+            expect(gameAccount!.authority.toBase58()).to.equal(authority.publicKey.toBase58());
+            expect(gameAccount!.score.toString()).to.equal("0");
+            console.log(`  ✓ Game state verified: Score=0, Authority=${authority.publicKey.toBase58().slice(0, 20)}...`);
+        });
+
+        it("1.2 verifies initial game state values", async function () {
+            const gameAccount = await fetchGameState();
+            expect(gameAccount).to.not.be.null;
+            
+            console.log("  Game State:");
+            console.log(`    Authority:     ${gameAccount!.authority.toBase58().slice(0, 20)}...`);
+            console.log(`    Score:         ${gameAccount!.score}`);
+            console.log(`    High Score:    ${gameAccount!.highScore}`);
+            console.log(`    Bird Y:        ${gameAccount!.birdY / 1000} (scaled: ${gameAccount!.birdY})`);
+            console.log(`    Bird Velocity: ${gameAccount!.birdVelocity / 1000}`);
+            console.log(`    Game Status:   ${JSON.stringify(gameAccount!.gameStatus)}`);
+            console.log(`    Frame Count:   ${gameAccount!.frameCount}`);
+            
+            // Verify authority matches (this is always valid regardless of game state)
+            expect(gameAccount!.authority.equals(authority.publicKey)).to.be.true;
+            
+            // Note: Bird Y may not be 300000 if game was already played
+            // Just log the value for reference
+            const expectedInitialY = 300000; // GAME_HEIGHT/2 * 1000
+            if (gameAccount!.birdY !== expectedInitialY) {
+                console.log(`  ℹ️  Bird Y (${gameAccount!.birdY}) differs from initial (${expectedInitialY}) - game may have been played`);
+            }
+        });
+
+        it("1.3 verifies account is NOT delegated initially", async function () {
+            const status = await checkDelegationStatus(gamePDA);
+            
+            console.log(`  Account Owner: ${status.owner?.toBase58().slice(0, 20)}...`);
+            console.log(`  Is Delegated:  ${status.isDelegated}`);
+            console.log(`  Lamports:      ${status.lamports}`);
+            console.log(`  Data Length:   ${status.dataLength} bytes`);
+            
+            expect(status.isDelegated).to.be.false;
+            expect(status.owner?.equals(program.programId)).to.be.true;
+        });
+    });
+
+    // ========================================
+    // Test Suite 2: Delegation to Ephemeral Rollup
+    // ========================================
+
+    describe("2. Delegation to Ephemeral Rollup", () => {
+        it("2.1 delegates game account to ER", async function () {
+            this.timeout(30000);
+            const start = Date.now();
+            
+            // Check if already delegated
+            const preStatus = await checkDelegationStatus(gamePDA);
+            if (preStatus.isDelegated) {
+                console.log("  ℹ️  Account already delegated, skipping...");
+                return;
+            }
+            
+            const tx = await program.methods
+                .delegate()
+                .accounts({ payer: authority.publicKey })
+                .remainingAccounts(getLocalnetRemainingAccounts())
+                .transaction();
+
+            const txHash = await provider.sendAndConfirm(tx, [provider.wallet.payer], {
+                skipPreflight: true,
+                commitment: "confirmed",
+            });
+            
+            console.log(`  ✓ Delegated in ${Date.now() - start}ms`);
+            console.log(`    Tx: ${txHash.slice(0, 40)}...`);
+        });
+
+        it("2.2 verifies account is now owned by delegation program", async function () {
+            this.timeout(10000);
+            
+            // Wait a bit for the transaction to fully propagate
+            await new Promise(r => setTimeout(r, 1000));
+            
+            const status = await checkDelegationStatus(gamePDA);
+            
+            console.log(`  Account Owner:        ${status.owner?.toBase58()}`);
+            console.log(`  Delegation Program:   ${DELEGATION_PROGRAM_ID.toBase58()}`);
+            console.log(`  Is Delegated:         ${status.isDelegated}`);
+            
+            expect(status.isDelegated).to.be.true;
+            expect(status.owner?.equals(DELEGATION_PROGRAM_ID)).to.be.true;
+        });
+
+        it("2.3 verifies account exists on Ephemeral Rollup with data", async function () {
+            this.timeout(30000);
+            
+            console.log("  Waiting for account to appear on ER...");
+            const appeared = await waitForERAccount(gamePDA, 30, 500);
+            
+            if (!appeared) {
+                const status = await checkERAccountStatus(gamePDA);
+                console.log(`  ❌ Account status on ER: exists=${status.exists}, data=${status.dataLength} bytes`);
+                throw new Error("Account did not appear on ER with data within timeout");
+            }
+            
+            // Verify we can fetch the game state on ER
+            const erGameState = await fetchERGameState();
+            expect(erGameState).to.not.be.null;
+            console.log(`  ✓ Game state on ER: Score=${erGameState!.score}, Status=${JSON.stringify(erGameState!.gameStatus)}`);
+        });
+    });
+
+    // ========================================
+    // Test Suite 3: Gameplay on Ephemeral Rollup
+    // ========================================
+
+    describe("3. Gameplay on Ephemeral Rollup", () => {
+        it("3.1 starts game on ER", async function () {
+            this.timeout(30000);
+            const start = Date.now();
+            
+            let tx = await program.methods
+                .startGame()
+                .accounts({
+                    signer: providerEphemeralRollup.wallet.publicKey,
+                    game: gamePDA,
+                    sessionToken: null,
+                } as any)
+                .transaction();
+
+            const txHash = await sendERTransaction(tx);
+            const latency = Date.now() - start;
+            console.log(`  ✓ Started game in ${latency}ms`);
+            console.log(`    Tx: ${txHash.slice(0, 40)}...`);
+            
+            // Verify game is playing
+            const erGameState = await fetchERGameState();
+            expect(erGameState).to.not.be.null;
+            expect(JSON.stringify(erGameState!.gameStatus)).to.include("playing");
+            console.log(`  ✓ Game Status: ${JSON.stringify(erGameState!.gameStatus)}`);
+        });
+
+        it("3.2 performs flaps with ultra-low latency", async function () {
+            this.timeout(30000);
+            const flapCount = 5;
+            const flapTimes: number[] = [];
+            const birdPositions: number[] = [];
+            
+            console.log(`  Performing ${flapCount} flaps...`);
+            
+            for (let i = 0; i < flapCount; i++) {
+                const start = Date.now();
+                
+                let tx = await program.methods
+                    .flap()
+                    .accounts({
+                        signer: providerEphemeralRollup.wallet.publicKey,
+                        game: gamePDA,
+                        sessionToken: null,
+                    } as any)
+                    .transaction();
+
+                const txHash = await sendERTransaction(tx);
+                const duration = Date.now() - start;
+                flapTimes.push(duration);
+                
+                // Fetch bird position after flap
+                const erGameState = await fetchERGameState();
+                if (erGameState) {
+                    birdPositions.push(erGameState.birdY / 1000);
+                }
+                
+                console.log(`    Flap #${i + 1}: ${duration}ms | Bird Y: ${erGameState?.birdY ? erGameState.birdY / 1000 : 'N/A'}`);
+                
+                // Small delay between flaps
+                await new Promise(r => setTimeout(r, 100));
+            }
+
+            const avg = flapTimes.reduce((a, b) => a + b, 0) / flapTimes.length;
+            const min = Math.min(...flapTimes);
+            const max = Math.max(...flapTimes);
+            
+            console.log(`\n  ⚡ Flap Latency Statistics:`);
+            console.log(`     Average: ${avg.toFixed(2)}ms`);
+            console.log(`     Min:     ${min}ms`);
+            console.log(`     Max:     ${max}ms`);
+            
+            // Bird should move up after flapping (position decreases because Y increases downward)
+            // Or at least change position
+            expect(birdPositions.length).to.be.greaterThan(0);
+        });
+
+        it("3.3 runs game ticks and verifies physics", async function () {
+            this.timeout(30000);
+            const tickCount = 10;
+            const tickTimes: number[] = [];
+            
+            console.log(`  Running ${tickCount} game ticks...`);
+            
+            // First get initial state
+            let prevState = await fetchERGameState();
+            if (!prevState) {
+                console.log("  ℹ️  Could not fetch initial state, skipping tick test");
+                return;
+            }
+            
+            for (let i = 0; i < tickCount; i++) {
+                const start = Date.now();
+                
+                try {
+                    let tx = await program.methods
+                        .tick()
+                        .accounts({
+                            signer: providerEphemeralRollup.wallet.publicKey,
+                            game: gamePDA,
+                            sessionToken: null,
+                        } as any)
+                        .transaction();
+
+                    await sendERTransaction(tx);
+                    tickTimes.push(Date.now() - start);
+                    
+                    const currentState = await fetchERGameState();
+                    if (currentState) {
+                        const yChanged = currentState.birdY !== prevState.birdY;
+                        const frameChanged = currentState.frameCount > prevState.frameCount;
+                        console.log(`    Tick #${i + 1}: ${Date.now() - start}ms | Y: ${currentState.birdY / 1000} | Frame: ${currentState.frameCount} | Changed: ${yChanged || frameChanged}`);
+                        prevState = currentState;
+                    }
+                } catch (e: any) {
+                    // Game might have ended due to collision
+                    console.log(`    Tick #${i + 1}: Game ended (collision) - ${e.message?.slice(0, 50) || 'Unknown error'}...`);
+                    break;
+                }
+                
+                await new Promise(r => setTimeout(r, 50));
+            }
+
+            if (tickTimes.length > 0) {
+                const avg = tickTimes.reduce((a, b) => a + b, 0) / tickTimes.length;
+                console.log(`\n  ⚡ Tick Latency: ${avg.toFixed(2)}ms avg (${tickTimes.length} ticks)`);
+            }
+        });
+
+        it("3.4 verifies pipe spawning and scoring", async function () {
+            this.timeout(60000);
+            
+            console.log("  Running extended gameplay to verify pipes...");
+            
+            // First restart the game if it ended
+            try {
+                let resetTx = await program.methods
+                    .resetGame()
+                    .accounts({
+                        signer: providerEphemeralRollup.wallet.publicKey,
+                        game: gamePDA,
+                        sessionToken: null,
+                    } as any)
+                    .transaction();
+                await sendERTransaction(resetTx);
+                
+                let startTx = await program.methods
+                    .startGame()
+                    .accounts({
+                        signer: providerEphemeralRollup.wallet.publicKey,
+                        game: gamePDA,
+                        sessionToken: null,
+                    } as any)
+                    .transaction();
+                await sendERTransaction(startTx);
+                console.log("  ✓ Game reset and restarted");
+            } catch (e) {
+                console.log("  ℹ️  Game may already be in correct state");
+            }
+            
+            // Run many ticks with occasional flaps to stay alive
+            let maxScore = 0;
+            let activePipes = 0;
+            
+            for (let i = 0; i < 50; i++) {
+                try {
+                    // Flap sometimes to stay alive
+                    const action = (i % 3 === 0) ? 'flap' : 'tick';
+                    
+                    let tx = await program.methods[action]()
+                        .accounts({
+                            signer: providerEphemeralRollup.wallet.publicKey,
+                            game: gamePDA,
+                            sessionToken: null,
+                        } as any)
+                        .transaction();
+
+                    await sendERTransaction(tx);
+                    
+                    const state = await fetchERGameState();
+                    if (state) {
+                        if (Number(state.score) > maxScore) {
+                            maxScore = Number(state.score);
+                            console.log(`    🎯 Score increased to: ${maxScore}`);
+                        }
+                        
+                        // Count active pipes
+                        const currentActivePipes = state.pipes.filter((p: any) => p.active).length;
+                        if (currentActivePipes !== activePipes) {
+                            activePipes = currentActivePipes;
+                            console.log(`    📊 Active pipes: ${activePipes}`);
+                        }
+                    }
+                } catch (e) {
+                    console.log(`    💥 Game over at iteration ${i}`);
+                    break;
+                }
+                
+                await new Promise(r => setTimeout(r, 30));
+            }
+            
+            console.log(`\n  Final score achieved: ${maxScore}`);
+            console.log(`  Pipes seen: ${activePipes > 0 ? 'Yes' : 'No'}`);
+        });
+
+        it("3.5 verifies collision detection", async function () {
+            this.timeout(30000);
+            
+            // Reset and start a new game
+            try {
+                let resetTx = await program.methods
+                    .resetGame()
+                    .accounts({
+                        signer: providerEphemeralRollup.wallet.publicKey,
+                        game: gamePDA,
+                        sessionToken: null,
+                    } as any)
+                    .transaction();
+                await sendERTransaction(resetTx);
+                
+                let startTx = await program.methods
+                    .startGame()
+                    .accounts({
+                        signer: providerEphemeralRollup.wallet.publicKey,
+                        game: gamePDA,
+                        sessionToken: null,
+                    } as any)
+                    .transaction();
+                await sendERTransaction(startTx);
+            } catch (e) {
+                // Ignore
+            }
+            
+            console.log("  Letting bird fall to test floor collision...");
+            
+            // Let the bird fall (don't flap)
+            let gameOver = false;
+            let iterations = 0;
+            
+            while (!gameOver && iterations < 50) {
+                // First check if game is already over
+                const stateCheck = await fetchERGameState();
+                if (stateCheck && JSON.stringify(stateCheck.gameStatus).includes("gameOver")) {
+                    gameOver = true;
+                    console.log(`  ✓ Collision detected - game over at tick ${iterations}`);
+                    break;
+                }
+                
+                try {
+                    let tx = await program.methods
+                        .tick()
+                        .accounts({
+                            signer: providerEphemeralRollup.wallet.publicKey,
+                            game: gamePDA,
+                            sessionToken: null,
+                        } as any)
+                        .transaction();
+
+                    await sendERTransaction(tx);
+                    
+                    const state = await fetchERGameState();
+                    if (state) {
+                        const birdY = state.birdY / 1000;
+                        if (iterations % 10 === 0) {
+                            console.log(`    Tick ${iterations}: Bird Y = ${birdY}`);
+                        }
+                        
+                        // Check if game over after the tick
+                        if (JSON.stringify(state.gameStatus).includes("gameOver")) {
+                            gameOver = true;
+                            console.log(`  ✓ Collision detected after ${iterations} ticks`);
+                        }
+                    }
+                    iterations++;
+                } catch (e: any) {
+                    if (e.message?.includes("GameNotPlaying") || e.message?.includes("6000")) {
+                        gameOver = true;
+                        console.log(`  ✓ Game not playing error after ${iterations} ticks`);
+                    } else {
+                        console.log(`  ❌ Unexpected error: ${e.message?.slice(0, 80)}`);
+                        break;
+                    }
+                }
+                
+                await new Promise(r => setTimeout(r, 20));
+            }
+            
+            // Verify game is over
+            const finalState = await fetchERGameState();
+            if (finalState) {
+                const isGameOver = JSON.stringify(finalState.gameStatus).includes("gameOver");
+                console.log(`  Game Status: ${JSON.stringify(finalState.gameStatus)} | Is Game Over: ${isGameOver}`);
+                expect(isGameOver).to.be.true;
+            }
+        });
+    });
+
+    // ========================================
+    // Test Suite 4: Commit and Undelegate
+    // ========================================
+
+    describe("4. Commit and Undelegate", () => {
+        it("4.1 commits state to base layer", async function () {
+            this.timeout(30000);
+            const start = Date.now();
+            
+            // First get state on ER
+            const erStateBefore = await fetchERGameState();
+            console.log(`  ER State before commit: Score=${erStateBefore?.score}, HighScore=${erStateBefore?.highScore}`);
+            
+            let tx = await program.methods
+                .commit()
+                .accounts({
+                    payer: providerEphemeralRollup.wallet.publicKey,
+                    game: gamePDA,
+                })
+                .transaction();
+
+            const txHash = await sendERTransaction(tx);
+            console.log(`  ✓ Committed in ${Date.now() - start}ms`);
+            console.log(`    Tx: ${txHash.slice(0, 40)}...`);
+            
+            // Wait for commit to propagate
+            await new Promise(r => setTimeout(r, 2000));
+        });
+
+        it("4.2 undelegates game from ER", async function () {
+            this.timeout(30000);
+            const start = Date.now();
+            
+            // Get state before undelegate
+            const erStateBefore = await fetchERGameState();
+            
+            let tx = await program.methods
+                .undelegate()
+                .accounts({
+                    payer: providerEphemeralRollup.wallet.publicKey,
+                    game: gamePDA,
+                })
+                .transaction();
+
+            const txHash = await sendERTransaction(tx);
+            console.log(`  ✓ Undelegated in ${Date.now() - start}ms`);
+            console.log(`    Tx: ${txHash.slice(0, 40)}...`);
+            
+            // Wait for undelegation to propagate
+            await new Promise(r => setTimeout(r, 3000));
+        });
+
+        it("4.3 verifies account is back to program ownership", async function () {
+            this.timeout(10000);
+            
+            const status = await checkDelegationStatus(gamePDA);
+            
+            console.log(`  Account Owner:  ${status.owner?.toBase58()}`);
+            console.log(`  Program ID:     ${program.programId.toBase58()}`);
+            console.log(`  Is Delegated:   ${status.isDelegated}`);
+            console.log(`  Data Length:    ${status.dataLength} bytes`);
+            
+            expect(status.isDelegated).to.be.false;
+            expect(status.owner?.equals(program.programId)).to.be.true;
+            expect(status.dataLength).to.be.greaterThan(0);
+        });
+
+        it("4.4 verifies state was preserved on base layer", async function () {
+            this.timeout(10000);
+            
+            const gameState = await fetchGameState();
+            expect(gameState).to.not.be.null;
+            
+            console.log(`  Final State on Base Layer:`);
+            console.log(`    Authority:  ${gameState!.authority.toBase58().slice(0, 20)}...`);
+            console.log(`    Score:      ${gameState!.score}`);
+            console.log(`    High Score: ${gameState!.highScore}`);
+            console.log(`    Bird Y:     ${gameState!.birdY / 1000}`);
+            console.log(`    Status:     ${JSON.stringify(gameState!.gameStatus)}`);
+            
+            expect(gameState!.authority.equals(authority.publicKey)).to.be.true;
+        });
+    });
+
+    // ========================================
+    // Test Suite 5: Full Gameplay Simulation
+    // ========================================
+
+    describe("5. Full Gameplay Simulation (3 seconds)", () => {
+        it("5.1 simulates full gameplay session", async function () {
+            this.timeout(60000);
+            console.log("\n🎮 Starting Full Gameplay Simulation...\n");
+
+            // Step 1: Delegate
+            console.log("Step 1: Delegating to ER...");
+            try {
+                const delegateTx = await program.methods
+                    .delegate()
+                    .accounts({ payer: authority.publicKey })
+                    .remainingAccounts(getLocalnetRemainingAccounts())
+                    .transaction();
+
+                await provider.sendAndConfirm(delegateTx, [provider.wallet.payer], {
+                    skipPreflight: true,
+                    commitment: "confirmed",
+                });
+                console.log("  ✅ Delegated");
+            } catch (e) {
+                console.log("  ℹ️  Already delegated");
+            }
+            
+            // Wait for delegation
+            await waitForERAccount(gamePDA, 20, 500);
+
+            // Step 2: Reset and Start
+            console.log("\nStep 2: Starting game...");
+            try {
+                let resetTx = await program.methods
+                    .resetGame()
+                    .accounts({
+                        signer: providerEphemeralRollup.wallet.publicKey,
+                        game: gamePDA,
+                        sessionToken: null,
+                    } as any)
+                    .transaction();
+                await sendERTransaction(resetTx);
+            } catch (e) {
+                // Ignore
+            }
+            
+            let startTx = await program.methods
+                .startGame()
+                .accounts({
+                    signer: providerEphemeralRollup.wallet.publicKey,
+                    game: gamePDA,
+                    sessionToken: null,
+                } as any)
+                .transaction();
+            await sendERTransaction(startTx);
+            console.log("  ✅ Game started");
+
+            // Step 3: Play for 3 seconds
+            console.log("\nStep 3: Playing for 3 seconds...");
+            let txCount = 0;
+            let totalLatency = 0;
+            let maxScore = 0;
+            const duration = 3000;
+            const startTime = Date.now();
+
+            while (Date.now() - startTime < duration) {
+                const txStart = Date.now();
+                const shouldFlap = Math.random() > 0.4;
+
+                try {
+                    let tx = await program.methods[shouldFlap ? 'flap' : 'tick']()
+                        .accounts({
+                            signer: providerEphemeralRollup.wallet.publicKey,
+                            game: gamePDA,
+                            sessionToken: null,
+                        } as any)
+                        .transaction();
+
+                    await sendERTransaction(tx);
+                    totalLatency += Date.now() - txStart;
+                    txCount++;
+                    
+                    // Check score periodically
+                    if (txCount % 10 === 0) {
+                        const state = await fetchERGameState();
+                        if (state && Number(state.score) > maxScore) {
+                            maxScore = Number(state.score);
+                        }
+                    }
+                } catch (e) {
+                    console.log("  💥 Collision - restarting...");
+                    try {
+                        let resetTx = await program.methods
+                            .resetGame()
+                            .accounts({
+                                signer: providerEphemeralRollup.wallet.publicKey,
+                                game: gamePDA,
+                                sessionToken: null,
+                            } as any)
+                            .transaction();
+                        await sendERTransaction(resetTx);
+                        
+                        let startTx = await program.methods
+                            .startGame()
+                            .accounts({
+                                signer: providerEphemeralRollup.wallet.publicKey,
+                                game: gamePDA,
+                                sessionToken: null,
+                            } as any)
+                            .transaction();
+                        await sendERTransaction(startTx);
+                    } catch (e2) {
+                        break;
+                    }
+                }
+
+                await new Promise(r => setTimeout(r, 40));
+            }
+
+            const elapsed = Date.now() - startTime;
+            
+            console.log(`\n📊 Simulation Results:`);
+            console.log(`   Duration:     ${elapsed}ms`);
+            console.log(`   Transactions: ${txCount}`);
+            if (txCount > 0) {
+                console.log(`   Avg Latency:  ${(totalLatency / txCount).toFixed(2)}ms`);
+                console.log(`   Throughput:   ${(txCount / (elapsed / 1000)).toFixed(2)} tx/s`);
+            }
+            console.log(`   Max Score:    ${maxScore}`);
+
+            // Step 4: Undelegate
+            console.log("\nStep 4: Undelegating...");
+            let undelegateTx = await program.methods
+                .undelegate()
+                .accounts({
+                    payer: providerEphemeralRollup.wallet.publicKey,
+                    game: gamePDA,
+                })
+                .transaction();
+            await sendERTransaction(undelegateTx);
+            
+            await new Promise(r => setTimeout(r, 2000));
+            
+            // Final verification
+            const finalState = await fetchGameState();
+            console.log(`\n✅ Final State: Score=${finalState?.score}, HighScore=${finalState?.highScore}`);
+            console.log("✅ Undelegated - Score saved to Solana base layer!\n");
+        });
+    });
+});

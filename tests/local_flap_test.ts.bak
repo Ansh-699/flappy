@@ -1,0 +1,199 @@
+/**
+ * Local Flappy Bird Test
+ * 
+ * Tests the full flow:
+ * 1. Initialize game on base layer
+ * 2. Delegate to local ER
+ * 3. Start game on ER
+ * 4. Send multiple flap transactions (simulating SPACE presses)
+ * 
+ * Prerequisites:
+ * - solana-test-validator running on localhost:8899
+ * - MagicBlock ER validator running on localhost:9000 (or your ER port)
+ */
+
+import * as anchor from "@coral-xyz/anchor";
+import { Program } from "@coral-xyz/anchor";
+import { Connection, Keypair, PublicKey, Transaction } from "@solana/web3.js";
+import { FlappyBird } from "../target/types/flappy_bird";
+
+// Configuration
+const BASE_LAYER_URL = "http://localhost:8899";
+const ER_URL = "http://localhost:9000"; // MagicBlock local ER
+const ER_WS_URL = "ws://localhost:9000";
+
+// Local ER validator identity (from MagicBlock local setup)
+const LOCAL_ER_VALIDATOR = new PublicKey("mAGicPQYBMvcYveUZA5F5UNNwyHvfYh5xkLS2Fr1mev");
+
+// Game seed - must match program
+const GAME_SEED = Buffer.from("game_v2");
+
+describe("Local Flappy Bird - Flap Test", () => {
+    // Base layer setup
+    const baseConnection = new Connection(BASE_LAYER_URL, "confirmed");
+    const provider = anchor.AnchorProvider.env();
+    anchor.setProvider(provider);
+    
+    const program = anchor.workspace.FlappyBird as Program<FlappyBird>;
+    const wallet = provider.wallet as anchor.Wallet;
+
+    // ER setup
+    const erConnection = new Connection(ER_URL, {
+        wsEndpoint: ER_WS_URL,
+        commitment: "confirmed",
+    });
+    const erProvider = new anchor.AnchorProvider(erConnection, wallet, {
+        commitment: "confirmed",
+    });
+    const erProgram = new Program(program.idl, erProvider);
+
+    // Derive game PDA
+    const [gamePDA] = PublicKey.findProgramAddressSync(
+        [GAME_SEED, wallet.publicKey.toBuffer()],
+        program.programId
+    );
+
+    console.log("═══════════════════════════════════════════════════════════════");
+    console.log("Local Flappy Bird Test");
+    console.log("  Base Layer:", BASE_LAYER_URL);
+    console.log("  ER Layer:  ", ER_URL);
+    console.log("  Wallet:    ", wallet.publicKey.toString());
+    console.log("  Game PDA:  ", gamePDA.toString());
+    console.log("═══════════════════════════════════════════════════════════════");
+
+    // Helper to send transaction to ER
+    const sendToER = async (tx: Transaction): Promise<string> => {
+        tx.feePayer = wallet.publicKey;
+        tx.recentBlockhash = (await erConnection.getLatestBlockhash()).blockhash;
+        const signed = await wallet.signTransaction(tx);
+        const txHash = await erConnection.sendRawTransaction(signed.serialize(), {
+            skipPreflight: true,
+        });
+        await erConnection.confirmTransaction(txHash, "confirmed");
+        return txHash;
+    };
+
+    it("1. Initialize game on base layer", async () => {
+        try {
+            const tx = await program.methods
+                .initialize()
+                .accounts({
+                    authority: wallet.publicKey,
+                })
+                .rpc();
+            console.log("✅ Initialize tx:", tx.slice(0, 20) + "...");
+        } catch (err: any) {
+            if (err.message?.includes("already in use")) {
+                console.log("ℹ️  Game already initialized");
+            } else {
+                throw err;
+            }
+        }
+
+        // Verify account exists
+        const account = await program.account.gameState.fetch(gamePDA);
+        console.log("   Authority:", account.authority.toString());
+        console.log("   Status:", Object.keys(account.gameStatus)[0]);
+    });
+
+    it("2. Delegate to local ER", async () => {
+        // Check if already delegated
+        const accountInfo = await baseConnection.getAccountInfo(gamePDA);
+        if (accountInfo?.owner.toString() === "DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh") {
+            console.log("ℹ️  Already delegated");
+            return;
+        }
+
+        const tx = await program.methods
+            .delegate()
+            .accounts({
+                payer: wallet.publicKey,
+            })
+            .remainingAccounts([
+                {
+                    pubkey: LOCAL_ER_VALIDATOR,
+                    isSigner: false,
+                    isWritable: false,
+                },
+            ])
+            .rpc({ skipPreflight: true });
+
+        console.log("✅ Delegate tx:", tx.slice(0, 20) + "...");
+
+        // Wait for delegation to propagate
+        await new Promise(resolve => setTimeout(resolve, 2000));
+    });
+
+    it("3. Start game on ER", async () => {
+        const tx = await erProgram.methods
+            .startGame()
+            .accounts({
+                game: gamePDA,
+                signer: wallet.publicKey,
+                sessionToken: null,
+            } as any)
+            .transaction();
+
+        const txHash = await sendToER(tx);
+        console.log("✅ Start game tx:", txHash.slice(0, 20) + "...");
+
+        // Fetch game state from ER
+        const gameState = await erProgram.account.gameState.fetch(gamePDA);
+        console.log("   Game status:", Object.keys(gameState.gameStatus)[0]);
+        console.log("   Bird Y:", gameState.birdY / 1000);
+    });
+
+    it("4. FLAP TEST - Send 10 rapid flap transactions", async () => {
+        console.log("\n🐦 Starting rapid flap test (simulating SPACE presses)...\n");
+
+        const flapTimes: number[] = [];
+
+        for (let i = 0; i < 10; i++) {
+            const start = Date.now();
+
+            const tx = await erProgram.methods
+                .flap()
+                .accounts({
+                    game: gamePDA,
+                    signer: wallet.publicKey,
+                    sessionToken: null,
+                } as any)
+                .transaction();
+
+            const txHash = await sendToER(tx);
+            const elapsed = Date.now() - start;
+            flapTimes.push(elapsed);
+
+            // Fetch updated state
+            const gameState = await erProgram.account.gameState.fetch(gamePDA);
+            
+            console.log(`   Flap ${i + 1}: ${elapsed}ms | Bird Y: ${gameState.birdY / 1000} | Score: ${gameState.score}`);
+
+            // Small delay between flaps (like real gameplay)
+            await new Promise(resolve => setTimeout(resolve, 50));
+        }
+
+        // Statistics
+        const avgTime = flapTimes.reduce((a, b) => a + b, 0) / flapTimes.length;
+        const minTime = Math.min(...flapTimes);
+        const maxTime = Math.max(...flapTimes);
+
+        console.log("\n═══════════════════════════════════════════════════════════════");
+        console.log("📊 FLAP PERFORMANCE STATISTICS");
+        console.log("═══════════════════════════════════════════════════════════════");
+        console.log(`   Average: ${avgTime.toFixed(1)}ms`);
+        console.log(`   Min:     ${minTime}ms`);
+        console.log(`   Max:     ${maxTime}ms`);
+        console.log(`   Target:  <10ms for ER`);
+        console.log("═══════════════════════════════════════════════════════════════");
+    });
+
+    it("5. Check final game state", async () => {
+        const gameState = await erProgram.account.gameState.fetch(gamePDA);
+        console.log("\n📋 Final Game State:");
+        console.log("   Status:", Object.keys(gameState.gameStatus)[0]);
+        console.log("   Bird Y:", gameState.birdY / 1000);
+        console.log("   Score:", gameState.score.toString());
+        console.log("   Frame Count:", gameState.frameCount.toString());
+    });
+});

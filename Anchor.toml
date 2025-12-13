@@ -6,14 +6,38 @@ resolution = true
 skip-lint = false
 
 [programs.devnet]
-counter = "49NcALUBrB68LN1QpgfHB4G4TP6UJuyb7EG9QuwxcTVy"
+flappy_bird = "DfJtsSqWNSetyRr3Fj4ZxM44oSBuZzAh4MTFMHQJSWvj"
+
+[programs.localnet]
+flappy_bird = "DfJtsSqWNSetyRr3Fj4ZxM44oSBuZzAh4MTFMHQJSWvj"
 
 [registry]
 url = "https://api.apr.dev"
 
 [provider]
-cluster = "devnet"
-wallet = "~/.config/solana/id.json"
+cluster = "localnet"
+wallet = "/tmp/test_wallet.json"
 
 [scripts]
 test = "bun run ts-mocha -p ./tsconfig.json -t 1000000 \"tests/**/*.ts\""
+
+# Clone required MagicBlock programs from devnet for local testing
+[[test.validator.clone]]
+# Delegation Program
+address = "DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh"
+
+[[test.validator.clone]]
+# Magic Program 
+address = "Magic11111111111111111111111111111111111111"
+
+[[test.validator.clone]]
+# Magic Context
+address = "MagicContext1111111111111111111111111111111"
+
+[[test.validator.clone]]
+# Local ER Validator Identity (needed for local ER setup)
+address = "mAGicPQYBMvcYveUZA5F5UNNwyHvfYh5xkLS2Fr1mev"
+
+[[test.validator.clone]]
+# Noop program for unique transactions  
+address = "noopb9bkMVfRPU8AsbpTUg8AQkHtKwMYZiFUjNRtMmV"

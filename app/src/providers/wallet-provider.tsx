@@ -6,8 +6,23 @@ import {
 import { WalletModalProvider } from "@solana/wallet-adapter-react-ui";
 import "@solana/wallet-adapter-react-ui/styles.css";
 
-// Devnet RPC endpoint
-const DEVNET_ENDPOINT = "https://api.devnet.solana.com";
+// ========================================
+// NETWORK CONFIGURATION - Toggle between localnet and devnet
+// ========================================
+const USE_LOCALNET = false; // Set to false for devnet (session keys work here)
+
+// Localnet configuration (base layer validator)
+// Use 127.0.0.1 instead of localhost for better Firefox CORS support
+const LOCALNET_ENDPOINT = "http://127.0.0.1:8899";
+const LOCALNET_WS_ENDPOINT = "ws://127.0.0.1:8900";
+
+// Devnet configuration (Helius RPC for better performance)
+const DEVNET_ENDPOINT = "https://devnet.helius-rpc.com/?api-key=dcef7561-099a-485b-9fe1-740a9e4da91e";
+const DEVNET_WS_ENDPOINT = "wss://devnet.helius-rpc.com/?api-key=dcef7561-099a-485b-9fe1-740a9e4da91e";
+
+// Select based on network
+const RPC_ENDPOINT = USE_LOCALNET ? LOCALNET_ENDPOINT : DEVNET_ENDPOINT;
+const WS_ENDPOINT = USE_LOCALNET ? LOCALNET_WS_ENDPOINT : DEVNET_WS_ENDPOINT;
 
 interface WalletProviderProps {
     children: ReactNode;
@@ -15,24 +30,21 @@ interface WalletProviderProps {
 
 /**
  * Wallet Provider that wraps the Solana wallet adapter providers.
- * Configured for Devnet by default.
+ * Network: ${USE_LOCALNET ? "LOCALNET" : "DEVNET"}
  */
 export function WalletProvider({ children }: WalletProviderProps) {
-    // Convert HTTP endpoint to WebSocket endpoint for subscriptions
-    const wsEndpoint = useMemo(() => {
-        return DEVNET_ENDPOINT.replace("https://", "wss://");
-    }, []);
-
     const config = useMemo(
         () => ({
-            wsEndpoint,
+            wsEndpoint: WS_ENDPOINT,
             commitment: "confirmed" as const,
         }),
-        [wsEndpoint]
+        []
     );
 
+    console.log(`[WalletProvider] Network: ${USE_LOCALNET ? "LOCALNET" : "DEVNET"}`, "RPC:", RPC_ENDPOINT);
+
     return (
-        <ConnectionProvider endpoint={DEVNET_ENDPOINT} config={config}>
+        <ConnectionProvider endpoint={RPC_ENDPOINT} config={config}>
             <SolanaWalletProvider wallets={[]} autoConnect>
                 <WalletModalProvider>{children}</WalletModalProvider>
             </SolanaWalletProvider>
