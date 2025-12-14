@@ -4,21 +4,23 @@ import {
     WalletProvider as SolanaWalletProvider,
 } from "@solana/wallet-adapter-react";
 import { WalletModalProvider } from "@solana/wallet-adapter-react-ui";
+import { PhantomWalletAdapter, SolflareWalletAdapter } from "@solana/wallet-adapter-wallets";
+import { GameStateProvider } from "./GameStateProvider";
 import "@solana/wallet-adapter-react-ui/styles.css";
 
 // ========================================
 // NETWORK CONFIGURATION - Toggle between localnet and devnet
 // ========================================
-const USE_LOCALNET = false; // Set to false for devnet (session keys work here)
+const USE_LOCALNET = false; // Devnet
 
 // Localnet configuration (base layer validator)
 // Use 127.0.0.1 instead of localhost for better Firefox CORS support
 const LOCALNET_ENDPOINT = "http://127.0.0.1:8899";
 const LOCALNET_WS_ENDPOINT = "ws://127.0.0.1:8900";
 
-// Devnet configuration (Helius RPC for better performance)
-const DEVNET_ENDPOINT = "https://devnet.helius-rpc.com/?api-key=dcef7561-099a-485b-9fe1-740a9e4da91e";
-const DEVNET_WS_ENDPOINT = "wss://devnet.helius-rpc.com/?api-key=dcef7561-099a-485b-9fe1-740a9e4da91e";
+// Devnet configuration
+const DEVNET_ENDPOINT = "https://api.devnet.solana.com";
+const DEVNET_WS_ENDPOINT = "wss://api.devnet.solana.com";
 
 // Select based on network
 const RPC_ENDPOINT = USE_LOCALNET ? LOCALNET_ENDPOINT : DEVNET_ENDPOINT;
@@ -33,6 +35,8 @@ interface WalletProviderProps {
  * Network: ${USE_LOCALNET ? "LOCALNET" : "DEVNET"}
  */
 export function WalletProvider({ children }: WalletProviderProps) {
+    const wallets = useMemo(() => [new PhantomWalletAdapter(), new SolflareWalletAdapter()], []);
+
     const config = useMemo(
         () => ({
             wsEndpoint: WS_ENDPOINT,
@@ -45,8 +49,12 @@ export function WalletProvider({ children }: WalletProviderProps) {
 
     return (
         <ConnectionProvider endpoint={RPC_ENDPOINT} config={config}>
-            <SolanaWalletProvider wallets={[]} autoConnect>
-                <WalletModalProvider>{children}</WalletModalProvider>
+            <SolanaWalletProvider wallets={wallets} autoConnect>
+                <WalletModalProvider>
+                    <GameStateProvider>
+                        {children}
+                    </GameStateProvider>
+                </WalletModalProvider>
             </SolanaWalletProvider>
         </ConnectionProvider>
     );

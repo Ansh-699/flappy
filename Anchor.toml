@@ -16,7 +16,11 @@ url = "https://api.apr.dev"
 
 [provider]
 cluster = "localnet"
-wallet = "/tmp/test_wallet.json"
+wallet = "~/.config/solana/id.json"
+
+[test.validator]
+# Required because we clone MagicBlock programs/accounts into the local validator.
+url = "https://devnet.magicblock.app"
 
 [scripts]
 test = "bun run ts-mocha -p ./tsconfig.json -t 1000000 \"tests/**/*.ts\""

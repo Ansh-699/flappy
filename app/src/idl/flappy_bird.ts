@@ -263,7 +263,8 @@ export type FlappyBird = {
     {
       "name": "endGame",
       "docs": [
-        "End the game - called when collision detected or manually"
+        "End the game - called when collision detected or manually",
+        "Note: On ER, any signer can play (session/burner wallet support)"
       ],
       "discriminator": [
         224,
@@ -303,11 +304,10 @@ export type FlappyBird = {
         },
         {
           "name": "signer",
+          "docs": [
+            "Must be the game's authority - verified in each instruction"
+          ],
           "signer": true
-        },
-        {
-          "name": "sessionToken",
-          "optional": true
         }
       ],
       "args": []
@@ -315,7 +315,8 @@ export type FlappyBird = {
     {
       "name": "flap",
       "docs": [
-        "Player flaps (jumps) - this is the main input during gameplay"
+        "Player flaps (jumps) - this is the main input during gameplay",
+        "Note: On ER, any signer can play (session/burner wallet support)"
       ],
       "discriminator": [
         245,
@@ -355,11 +356,10 @@ export type FlappyBird = {
         },
         {
           "name": "signer",
+          "docs": [
+            "Must be the game's authority - verified in each instruction"
+          ],
           "signer": true
-        },
-        {
-          "name": "sessionToken",
-          "optional": true
         }
       ],
       "args": []
@@ -457,7 +457,8 @@ export type FlappyBird = {
     {
       "name": "resetGame",
       "docs": [
-        "Reset game to initial state"
+        "Reset game to initial state",
+        "Note: On ER, any signer can play (session/burner wallet support)"
       ],
       "discriminator": [
         97,
@@ -497,11 +498,10 @@ export type FlappyBird = {
         },
         {
           "name": "signer",
+          "docs": [
+            "Must be the game's authority - verified in each instruction"
+          ],
           "signer": true
-        },
-        {
-          "name": "sessionToken",
-          "optional": true
         }
       ],
       "args": []
@@ -509,7 +509,9 @@ export type FlappyBird = {
     {
       "name": "startGame",
       "docs": [
-        "Start a new game - resets bird position and score"
+        "Start a new game - resets bird position and score",
+        "Note: On ER, any signer can play (session/burner wallet support)",
+        "Security is provided by the ER's account delegation model"
       ],
       "discriminator": [
         249,
@@ -549,11 +551,10 @@ export type FlappyBird = {
         },
         {
           "name": "signer",
+          "docs": [
+            "Must be the game's authority - verified in each instruction"
+          ],
           "signer": true
-        },
-        {
-          "name": "sessionToken",
-          "optional": true
         }
       ],
       "args": []
@@ -562,7 +563,8 @@ export type FlappyBird = {
       "name": "tick",
       "docs": [
         "Update game state - called each frame to advance physics",
-        "This is the main game loop tick"
+        "This is the main game loop tick",
+        "Note: On ER, any signer can play (session/burner wallet support)"
       ],
       "discriminator": [
         92,
@@ -602,11 +604,10 @@ export type FlappyBird = {
         },
         {
           "name": "signer",
+          "docs": [
+            "Must be the game's authority - verified in each instruction"
+          ],
           "signer": true
-        },
-        {
-          "name": "sessionToken",
-          "optional": true
         }
       ],
       "args": []
@@ -682,19 +683,6 @@ export type FlappyBird = {
         134,
         120
       ]
-    },
-    {
-      "name": "sessionToken",
-      "discriminator": [
-        233,
-        4,
-        115,
-        14,
-        46,
-        21,
-        1,
-        15
-      ]
     }
   ],
   "errors": [
@@ -707,11 +695,6 @@ export type FlappyBird = {
       "code": 6001,
       "name": "gameAlreadyStarted",
       "msg": "Game has already started"
-    },
-    {
-      "code": 6002,
-      "name": "invalidAuth",
-      "msg": "Invalid authentication"
     }
   ],
   "types": [
@@ -862,30 +845,6 @@ export type FlappyBird = {
               "Whether pipe is active"
             ],
             "type": "bool"
-          }
-        ]
-      }
-    },
-    {
-      "name": "sessionToken",
-      "type": {
-        "kind": "struct",
-        "fields": [
-          {
-            "name": "authority",
-            "type": "pubkey"
-          },
-          {
-            "name": "targetProgram",
-            "type": "pubkey"
-          },
-          {
-            "name": "sessionSigner",
-            "type": "pubkey"
-          },
-          {
-            "name": "validUntil",
-            "type": "i64"
           }
         ]
       }

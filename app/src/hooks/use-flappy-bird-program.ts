@@ -1,10 +1,12 @@
-import { useCallback, useEffect, useMemo, useState, useRef } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
 import { Program, AnchorProvider, BN, setProvider } from "@coral-xyz/anchor";
-import { Connection, PublicKey, Transaction } from "@solana/web3.js";
+import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SystemProgram, Transaction } from "@solana/web3.js";
 import { type FlappyBird } from "../idl/flappy_bird";
 import IDL from "../idl/flappy_bird.json";
 import { useSessionKeyManager } from "@magicblock-labs/gum-react-sdk";
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 // Note: @magicblock-labs/ephemeral-rollups-sdk is imported dynamically to avoid
 // Buffer not defined errors during module initialization
@@ -12,7 +14,7 @@ import { useSessionKeyManager } from "@magicblock-labs/gum-react-sdk";
 // ========================================
 // NETWORK CONFIGURATION - Toggle between localnet and devnet
 // ========================================
-const USE_LOCALNET = false; // Set to false for devnet (session keys work here)
+const USE_LOCALNET = false; // Devnet
 
 // Localnet configuration (MagicBlock ER validator)
 // Use 127.0.0.1 instead of localhost for better Firefox CORS support
@@ -99,6 +101,14 @@ export function useFlappyBirdProgram() {
         pipes: Pipe[];
     } | null>(null);
 
+    // Devnet safety: avoid sending overlapping tick transactions (same writable account)
+    const tickInFlightRef = useRef(false);
+    const lastTickAttemptMsRef = useRef(0);
+
+    // Session key funding cache (so we don't check/fund on every tick)
+    const sessionFeePayerFundedRef = useRef<Set<string>>(new Set());
+    const sessionFeePayerLastCheckMsRef = useRef<Map<string, number>>(new Map());
+
     // Base layer Anchor provider and program
     const program = useMemo(() => {
         if (!wallet.publicKey || !wallet.signTransaction || !wallet.signAllTransactions) {
@@ -129,33 +139,17 @@ export function useFlappyBirdProgram() {
     }, []);
 
     const erProvider = useMemo(() => {
-        console.log("[useFlappyBirdProgram] Creating erProvider. Wallet state:", {
-            connected: wallet.connected,
-            hasPublicKey: !!wallet.publicKey,
-            hasSignTransaction: !!wallet.signTransaction,
-            hasSignAllTransactions: !!wallet.signAllTransactions
-        });
-
-        if (!wallet.publicKey) {
-            console.warn("[useFlappyBirdProgram] erProvider creation skipped: No public key");
+        if (!wallet.publicKey || !wallet.signTransaction || !wallet.signAllTransactions) {
             return null;
         }
 
-        // Create a compliant wallet object even if capabilities are missing
-        // This allows erProgram to be created for read-only operations (fetching functionality)
-        const diffWallet = {
-            publicKey: wallet.publicKey,
-            signTransaction: wallet.signTransaction || (async (tx: any) => {
-                throw new Error("signTransaction not implemented in dummy wallet");
-            }),
-            signAllTransactions: wallet.signAllTransactions || (async (txs: any[]) => {
-                throw new Error("signAllTransactions not implemented in dummy wallet");
-            })
-        };
-
         return new AnchorProvider(
             erConnection,
-            diffWallet,
+            {
+                publicKey: wallet.publicKey,
+                signTransaction: wallet.signTransaction,
+                signAllTransactions: wallet.signAllTransactions,
+            },
             { commitment: "confirmed" }
         );
     }, [erConnection, wallet.publicKey, wallet.signTransaction, wallet.signAllTransactions]);
@@ -168,34 +162,26 @@ export function useFlappyBirdProgram() {
         return new Program<FlappyBird>(IDL as FlappyBird, erProvider);
     }, [erProvider]);
 
-    // Session Key Manager - only available on devnet where Gum SDK programs are deployed
-    // On localnet, session keys are disabled since the Gum programs don't exist
-
-    // Memoize the wallet adapter object to prevent useSessionKeyManager from triggering re-renders
-    const walletAdapter = useMemo(() => ({
-        ...wallet,
-        publicKey: wallet.publicKey ?? new PublicKey("11111111111111111111111111111111"),
-    }), [wallet.publicKey, wallet.signTransaction, wallet.signAllTransactions, wallet.connected]);
-
-    const sessionWallet = USE_LOCALNET ? null : useSessionKeyManager(
-        walletAdapter as any,
+    // Session Key Manager - always use devnet where Gum SDK programs are deployed
+    // gum-react-sdk can crash when wallet.publicKey is null on first render.
+    // Use a stable dummy keypair that won't change between renders
+    const [dummyKeypair] = useState(() => Keypair.generate());
+    
+    // Only initialize session wallet when we have a real wallet connection
+    const sessionWallet = useSessionKeyManager(
+        wallet.publicKey ? wallet : {
+            ...wallet,
+            publicKey: dummyKeypair.publicKey,
+        } as any,
         connection,
         "devnet"
     );
 
-    // On localnet, session keys are disabled
-    const sessionToken = USE_LOCALNET ? null : sessionWallet?.sessionToken ?? null;
-    const isSessionLoading = USE_LOCALNET ? false : sessionWallet?.isLoading ?? false;
+    const { sessionToken, createSession: sdkCreateSession, isLoading: isSessionLoading } = sessionWallet;
 
     const createSession = useCallback(async () => {
-        if (USE_LOCALNET) {
-            throw new Error("Session keys are only available on devnet. On localnet, each transaction requires wallet approval.");
-        }
-        if (!sessionWallet) {
-            throw new Error("Session wallet not initialized");
-        }
-        return await sessionWallet.createSession(new PublicKey(IDL.address));
-    }, [sessionWallet]);
+        return await sdkCreateSession(new PublicKey(IDL.address));
+    }, [sdkCreateSession]);
 
     // Derive PDA from wallet public key - using game_v2 seed to get fresh PDA
     const derivePDA = useCallback((authority: PublicKey) => {
@@ -235,7 +221,7 @@ export function useFlappyBirdProgram() {
                 passed: p.passed,
                 active: p.active,
             }));
-
+            
             setGameAccount({
                 score: BigInt(account.score.toString()),
                 highScore: BigInt(account.highScore.toString()),
@@ -371,6 +357,36 @@ export function useFlappyBirdProgram() {
             return;
         }
 
+        // Initial fetch from ER to get current state
+        const fetchErState = async () => {
+            try {
+                const account = await erProgram.account.gameState.fetch(gamePubkey);
+                const pipes = (account.pipes || []).map((p: any) => ({
+                    x: p.x,
+                    gapY: p.gapY,
+                    passed: p.passed,
+                    active: p.active,
+                }));
+                setErGameValue({
+                    score: BigInt(account.score.toString()),
+                    high_score: BigInt(account.highScore.toString()),
+                    birdY: account.birdY,
+                    birdVelocity: account.birdVelocity,
+                    gameStatus: getGameStatusNumber(account.gameStatus as unknown as GameStatusEnum),
+                    pipes,
+                });
+                console.log("[ER] Initial state fetched:", {
+                    score: account.score.toString(),
+                    birdY: account.birdY / 1000,
+                    status: account.gameStatus,
+                });
+            } catch (err) {
+                console.debug("[ER] Initial fetch failed:", err);
+            }
+        };
+        
+        fetchErState();
+
         const subscriptionId = erConnection.onAccountChange(
             gamePubkey,
             async (accountInfo) => {
@@ -391,13 +407,16 @@ export function useFlappyBirdProgram() {
                         pipes,
                     });
                 } catch (err) {
-                    console.error("Failed to decode ER account data:", err);
+                    console.error("[ER] Failed to decode account data:", err);
                 }
             },
             "confirmed"
         );
 
+        console.log("[ER] WebSocket subscription active for:", gamePubkey.toBase58());
+
         return () => {
+            console.log("[ER] Cleaning up WebSocket subscription");
             erConnection.removeAccountChangeListener(subscriptionId);
         };
     }, [erProgram, gamePubkey, erConnection, delegationStatus]);
@@ -518,173 +537,211 @@ export function useFlappyBirdProgram() {
         }
     }, [program, wallet.publicKey, gamePubkey]);
 
-    // Refs for stable access inside callbacks to prevent re-creation of performErAction
-    const contextRef = useRef({
-        program,
-        wallet,
-        gamePubkey,
-        sessionToken,
-        sessionWallet,
-        erProgram,
-        connection
-    });
-
-    useEffect(() => {
-        contextRef.current = {
-            program,
-            wallet,
-            gamePubkey,
-            sessionToken,
-            sessionWallet,
-            erProgram,
-            connection
-        };
-    });
-
     const performErAction = useCallback(async (
         methodBuilder: any,
-        actionName: string,
-        confirm: boolean = true // New parameter, default is true
+        actionName: string
     ): Promise<string> => {
-        const { program, wallet, gamePubkey, sessionToken, sessionWallet, erProgram } = contextRef.current;
-
         if (!program || !wallet.publicKey || !wallet.signTransaction || !gamePubkey) {
             throw new Error("Game not initialized or not delegated");
+        }
+
+        // Tick is called on an interval; on devnet we must avoid overlap and excessive TPS.
+        if (actionName === "tick") {
+            if (tickInFlightRef.current) {
+                return "";
+            }
+            if (!USE_LOCALNET) {
+                const now = Date.now();
+                if (now - lastTickAttemptMsRef.current < 150) {
+                    return "";
+                }
+                lastTickAttemptMsRef.current = now;
+            }
+            tickInFlightRef.current = true;
         }
 
         setIsLoading(true);
         setError(null);
 
+        let builtTx: Transaction | null = null;
+        let conn: Connection | null = null;
+        let latestBlockhash: Awaited<ReturnType<Connection["getLatestBlockhash"]>> | null = null;
+
+        const ensureSessionFeePayerFunded = async (c: Connection, sessionFeePayer: PublicKey) => {
+            const key = sessionFeePayer.toBase58();
+
+            if (sessionFeePayerFundedRef.current.has(key)) return;
+
+            const now = Date.now();
+            const last = sessionFeePayerLastCheckMsRef.current.get(key) ?? 0;
+            if (now - last < 15_000) return;
+            sessionFeePayerLastCheckMsRef.current.set(key, now);
+
+            // Only the wallet can fund the session key (one-time prompt).
+            if (!wallet.publicKey || !wallet.signTransaction) return;
+
+            const balance = await c.getBalance(sessionFeePayer, "confirmed");
+            const minLamports = 200_000; // 0.0002 SOL
+            if (balance >= minLamports) {
+                sessionFeePayerFundedRef.current.add(key);
+                return;
+            }
+
+            const topUpLamports = 2_000_000; // 0.002 SOL
+            const fundTx = new Transaction().add(
+                SystemProgram.transfer({
+                    fromPubkey: wallet.publicKey,
+                    toPubkey: sessionFeePayer,
+                    lamports: topUpLamports,
+                })
+            );
+            fundTx.feePayer = wallet.publicKey;
+            const bh = await c.getLatestBlockhash();
+            fundTx.recentBlockhash = bh.blockhash;
+            const signed = (await wallet.signTransaction(fundTx)) as Transaction;
+            const sig = await c.sendRawTransaction(signed.serialize(), {
+                skipPreflight: false,
+                maxRetries: 3,
+            });
+            await c.confirmTransaction(
+                { signature: sig, blockhash: bh.blockhash, lastValidBlockHeight: bh.lastValidBlockHeight },
+                "confirmed"
+            );
+            sessionFeePayerFundedRef.current.add(key);
+            console.log(`[ER session] funded session key ${key} with ${topUpLamports / LAMPORTS_PER_SOL} SOL: ${sig}`);
+        };
+
         try {
-            // Use the specific validator endpoint where we delegated the account
-            // Do NOT use the generic endpoint - it may route to a different validator that doesn't have our account
-            const validatorErConnection = new Connection(ER_ENDPOINT, {
+            // IMPORTANT: must send writes to the same ER validator that holds the delegation.
+            // The generic router can land on a different validator/region and will reject writes
+            // with InvalidWritableAccount.
+            conn = new Connection(ER_ENDPOINT, {
                 wsEndpoint: ER_WS_ENDPOINT,
                 commitment: "confirmed",
             });
 
-            // Check usage of erProgram
-            if (!erProgram) {
-                console.warn("[performErAction] erProgram is null! Cannot fetch state.");
-            } else {
-                console.log("[performErAction] erProgram is available.");
-            }
-
-            // Check if we have a valid session
             const hasSession = sessionToken != null && sessionWallet != null;
-            const signer = hasSession ? sessionWallet.publicKey : wallet.publicKey;
+            const hasSessionSigner = hasSession && typeof (sessionWallet as any)?.signTransaction === "function";
+            const sessionFeePayer: PublicKey | null = hasSessionSigner ? (sessionWallet as any).publicKey : null;
+            const signer: PublicKey = hasSession ? (sessionWallet as any).publicKey : wallet.publicKey;
 
-            console.log(`[ER Action: ${actionName}]`);
-            console.log(`  Has Session: ${hasSession}`);
-            console.log(`  Signer: ${signer?.toString()}`);
-            console.log(`  Session Token: ${sessionToken ? (typeof sessionToken === 'object' ? JSON.stringify(sessionToken) : sessionToken.toString()) : 'null'}`);
-            console.log(`  Game PDA: ${gamePubkey.toString()}`);
-            console.log(`  ER Endpoint: ${ER_ENDPOINT}`);
-
-            // Build accounts
             const accounts: any = {
                 game: gamePubkey,
-                signer: signer,
+                signer,
                 sessionToken: hasSession ? sessionToken : null,
             };
 
-            // Build transaction
-            let tx = await methodBuilder
-                .accounts(accounts)
-                .transaction();
-            tx.feePayer = signer;
-            tx.recentBlockhash = (await validatorErConnection.getLatestBlockhash()).blockhash;
-
-            // Sign
-            if (hasSession && sessionWallet) {
-                if (typeof sessionWallet.signTransaction === 'function') {
-                    // It's a Wallet Adapter-like object
-                    tx.feePayer = sessionWallet.publicKey;
-                    // Note: sessionWallet.signTransaction returns the signed tx
-                    // We must assign it back if it returns a new object, or it modifies in place?
-                    // Standard wallet adapter returns Promise<Transaction>
-                    const signedTx = await sessionWallet.signTransaction(tx);
-                    // If it returns a new object, we must use it. 
-                    // But we declared 'let tx' so we can assign it.
-                    // Wait, methodBuilder.transaction() returns 'Transaction'.
-                    // Typescript might complain if types mismatch.
-                    // Let's assume it works as before.
-                    // The previous code had: tx = await sessionWallet.signTransaction(tx);
-                    // So let's convert 'let tx' back to that usage.
-                    const potentiallyNewTx = await sessionWallet.signTransaction(tx);
-                    if (potentiallyNewTx) {
-                        tx = potentiallyNewTx;
-                    }
-                } else {
-                    // It's likely a Keypair
-                    tx.sign(sessionWallet);
-                }
-            } else {
-                await wallet.signTransaction(tx);
+            builtTx = await methodBuilder.accounts(accounts).transaction();
+            if (!builtTx) {
+                throw new Error("Failed to build transaction");
             }
 
-            // Send
-            const txHash = await validatorErConnection.sendRawTransaction(tx.serialize(), {
-                skipPreflight: true,
+            if (sessionFeePayer) {
+                await ensureSessionFeePayerFunded(conn, sessionFeePayer);
+            }
+
+            const feePayer: PublicKey = sessionFeePayer ?? wallet.publicKey;
+            builtTx.feePayer = feePayer;
+
+            latestBlockhash = await conn.getLatestBlockhash();
+            builtTx.recentBlockhash = latestBlockhash.blockhash;
+
+            if (hasSessionSigner) {
+                builtTx = await (sessionWallet as any).signTransaction(builtTx);
+            }
+            if (!sessionFeePayer) {
+                builtTx = (await wallet.signTransaction(builtTx!)) as Transaction;
+            }
+
+            const txHash = await conn.sendRawTransaction(builtTx!.serialize(), {
+                skipPreflight: actionName !== "tick",
+                maxRetries: 3,
             });
+            await conn.confirmTransaction(
+                {
+                    signature: txHash,
+                    blockhash: latestBlockhash.blockhash,
+                    lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
+                },
+                "confirmed"
+            );
 
-            if (confirm) {
-                await validatorErConnection.confirmTransaction(txHash, "confirmed");
-            } else {
-                if (actionName !== "tick") console.log(`[ER Action: ${actionName}] Sent (Fire & Forget): ${txHash}`);
-            }
-
-            // Refresh ER game value
             if (erProgram) {
                 try {
-                    // console.log("[performErAction] Fetching updated game state from ER...");
                     const account = await erProgram.account.gameState.fetch(gamePubkey);
-                    // console.log("[performErAction] Fetched account raw:", account);
-
                     const pipes = (account.pipes || []).map((p: any) => ({
                         x: p.x,
                         gapY: p.gapY,
                         passed: p.passed,
                         active: p.active,
                     }));
-
-                    const newState = {
+                    setErGameValue({
                         score: BigInt(account.score.toString()),
                         high_score: BigInt(account.highScore.toString()),
                         birdY: account.birdY,
                         birdVelocity: account.birdVelocity,
                         gameStatus: getGameStatusNumber(account.gameStatus as unknown as GameStatusEnum),
                         pipes,
-                    };
-
-                    // Serialize for readable logging (handle BigInt)
-                    const logSafeState = JSON.parse(JSON.stringify(newState, (key, value) =>
-                        typeof value === 'bigint' ? value.toString() : value
-                    ));
-
-                    if (actionName === "batch tick") {
-                        // Less verbose for ticks
-                        if (Math.random() < 0.05) console.log("[performErAction] New ER State:", logSafeState);
-                    } else {
-                        console.log("[performErAction] New ER State:", logSafeState);
-                    }
-
-                    setErGameValue(newState);
-                } catch (fetchErr) {
-                    console.error("[performErAction] Failed to fetch/parse ER state:", fetchErr);
+                    });
+                } catch {
                     // Ignore fetch errors
                 }
             }
 
             return txHash;
         } catch (err) {
+            const anyErr = err as any;
+            const signature: string | null =
+                (typeof anyErr?.signature === "string" && anyErr.signature.length > 0) ? anyErr.signature :
+                (typeof anyErr?.txid === "string" && anyErr.txid.length > 0) ? anyErr.txid :
+                null;
+
+            console.error(`[ER ${actionName}] failed:`, err);
+            if (signature) {
+                console.error(`[ER ${actionName}] signature:`, signature);
+            }
+
+            try {
+                if (Array.isArray(anyErr?.logs)) {
+                    console.error(`[ER ${actionName}] logs (from error):`, anyErr.logs);
+                }
+
+                if (signature && conn) {
+                    for (let i = 0; i < 3; i++) {
+                        const tx = await conn.getTransaction(signature, {
+                            commitment: "confirmed",
+                            maxSupportedTransactionVersion: 0,
+                        });
+                        const logs = tx?.meta?.logMessages;
+                        if (logs && logs.length) {
+                            console.error(`[ER ${actionName}] logs (confirmed):`, logs);
+                            break;
+                        }
+                        await sleep(400);
+                    }
+                } else if (conn && builtTx) {
+                    try {
+                        const sim = await conn.simulateTransaction(builtTx);
+                        console.error(`[ER ${actionName}] simulate err:`, sim.value.err);
+                        console.error(`[ER ${actionName}] simulate logs:`, sim.value.logs);
+                    } catch (simErr) {
+                        console.error(`[ER ${actionName}] simulate failed:`, simErr);
+                    }
+                }
+            } catch (logErr) {
+                console.error(`[ER ${actionName}] failed to fetch logs:`, logErr);
+            }
+
             const message = err instanceof Error ? err.message : `Failed to ${actionName} on ER`;
             setError(message);
             throw err;
         } finally {
             setIsLoading(false);
+            if (actionName === "tick") {
+                tickInFlightRef.current = false;
+            }
         }
-    }, [erConnection]); // Added erConnection dependency
+    }, [program, wallet.publicKey, wallet.signTransaction, gamePubkey, sessionToken, sessionWallet, erProgram]);
 
     // Start game on Ephemeral Rollup
     const startGameOnER = useCallback(async (): Promise<string> => {
@@ -705,15 +762,15 @@ export function useFlappyBirdProgram() {
     }, [program, performErAction]);
 
     // Flap (jump) on Ephemeral Rollup - main game input
-    const flapOnER = useCallback(async (confirm: boolean = true): Promise<string> => {
+    const flapOnER = useCallback(async (): Promise<string> => {
         if (!program) throw new Error("Program not loaded");
-        return performErAction(program.methods.flap(), "flap", confirm);
+        return performErAction(program.methods.flap(), "flap");
     }, [program, performErAction]);
 
     // Tick (physics update) on Ephemeral Rollup
-    const tickOnER = useCallback(async (confirm: boolean = true): Promise<string> => {
+    const tickOnER = useCallback(async (): Promise<string> => {
         if (!program) throw new Error("Program not loaded");
-        return performErAction(program.methods.tick(), "tick", confirm);
+        return performErAction(program.methods.tick(), "tick");
     }, [program, performErAction]);
 
     // ========================================
@@ -746,32 +803,11 @@ export function useFlappyBirdProgram() {
                     },
                 ])
                 .rpc({
-                    skipPreflight: true,
-                });
+                skipPreflight: true,
+            });
 
-            // Wait for delegation to propagate to ER
-            // The ER validator needs time to clone the delegated account
-            console.log("[Delegate] Waiting for ER to sync delegated account...");
-
-            // Retry loop to verify account exists on ER
-            let isErSynced = false;
-            for (let attempt = 0; attempt < 10; attempt++) {
-                await new Promise(resolve => setTimeout(resolve, 1000));
-                try {
-                    const erAccountInfo = await erConnection.getAccountInfo(gamePubkey!);
-                    if (erAccountInfo) {
-                        console.log(`[Delegate] ER synced after ${attempt + 1} seconds`);
-                        isErSynced = true;
-                        break;
-                    }
-                } catch (e) {
-                    console.log(`[Delegate] ER sync attempt ${attempt + 1}/10...`);
-                }
-            }
-
-            if (!isErSynced) {
-                console.warn("[Delegate] Warning: Could not verify ER sync after 10s");
-            }
+            // Wait a bit for delegation to propagate
+            await new Promise(resolve => setTimeout(resolve, 2000));
 
             // Recheck delegation status
             await checkDelegationStatus();
@@ -788,7 +824,6 @@ export function useFlappyBirdProgram() {
     }, [program, wallet.publicKey, checkDelegationStatus]);
 
     // Commit state from ER to base layer (runs on ER)
-    // Uses generic ER endpoint to route to the correct validator
     const commit = useCallback(async (): Promise<string> => {
         if (!program || !wallet.publicKey || !wallet.signTransaction || !gamePubkey) {
             throw new Error("Game not initialized or not delegated");
@@ -798,9 +833,9 @@ export function useFlappyBirdProgram() {
         setError(null);
 
         try {
-            // Use generic endpoint for commit - it routes to the correct validator
-            const genericErConnection = new Connection(ER_GENERIC_ENDPOINT, {
-                wsEndpoint: ER_GENERIC_WS_ENDPOINT,
+            // Must hit the same ER validator that holds the delegation.
+            const genericErConnection = new Connection(ER_ENDPOINT, {
+                wsEndpoint: ER_WS_ENDPOINT,
                 commitment: "confirmed",
             });
 
@@ -839,7 +874,6 @@ export function useFlappyBirdProgram() {
     }, [program, erProvider, erConnection, wallet.publicKey, gamePubkey, fetchGameAccount]);
 
     // Undelegate the game from ER (runs on ER)
-    // Uses the generic ER endpoint which routes to the correct validator internally
     const undelegate = useCallback(async (): Promise<string> => {
         if (!program || !wallet.publicKey || !wallet.signTransaction || !gamePubkey) {
             throw new Error("Game not initialized or not delegated");
@@ -849,9 +883,9 @@ export function useFlappyBirdProgram() {
         setError(null);
 
         try {
-            // Use generic endpoint for undelegate - it routes to the correct validator
-            const genericErConnection = new Connection(ER_GENERIC_ENDPOINT, {
-                wsEndpoint: ER_GENERIC_WS_ENDPOINT,
+            // Must hit the same ER validator that holds the delegation.
+            const genericErConnection = new Connection(ER_ENDPOINT, {
+                wsEndpoint: ER_WS_ENDPOINT,
                 commitment: "confirmed",
             });
 
@@ -910,12 +944,12 @@ export function useFlappyBirdProgram() {
         try {
             setIsLoading(true);
             console.log(`[Airdrop] Requesting ${amount} SOL for ${wallet.publicKey.toString()}`);
-
+            
             const signature = await connection.requestAirdrop(
                 wallet.publicKey,
                 amount * 1_000_000_000 // Convert to lamports
             );
-
+            
             await connection.confirmTransaction(signature, "confirmed");
             console.log("[Airdrop] Success:", signature);
             return signature;
@@ -936,31 +970,6 @@ export function useFlappyBirdProgram() {
         const balance = await connection.getBalance(wallet.publicKey);
         return balance / 1_000_000_000; // Convert to SOL
     }, [connection, wallet.publicKey]);
-
-    // Fetch Leaderboard (All accounts)
-    const getLeaderboard = useCallback(async () => {
-        if (!program) return [];
-        try {
-            // Fetch all game accounts from base layer
-            // This incentivizes "Commit" to updates global leaderboard
-            const allAccounts = await program.account.gameState.all();
-
-            // Map and sort
-            const sorted = allAccounts.map(acc => ({
-                pubkey: acc.publicKey,
-                highScore: Number(acc.account.highScore),
-                authority: acc.account.authority
-            }))
-                .sort((a, b) => b.highScore - a.highScore)
-                .slice(0, 5); // Top 5
-
-            return sorted;
-
-        } catch (e) {
-            console.error("Failed to fetch leaderboard", e);
-            return [];
-        }
-    }, [program]);
 
     return {
         program,
@@ -991,7 +1000,6 @@ export function useFlappyBirdProgram() {
         checkDelegation: checkDelegationStatus,
         airdrop,
         getBalance,
-        getLeaderboard, // Exported
         isLocalnet: USE_LOCALNET,
         // Session
         createSession,

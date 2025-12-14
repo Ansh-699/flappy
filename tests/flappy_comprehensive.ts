@@ -45,6 +45,11 @@ const JUMP_VELOCITY = -8000; // -8.0 * 1000
 const PIPE_GAP = 150;
 
 describe("Flappy Bird - Comprehensive Test Suite", () => {
+    // Opt-in: requires a local ER setup and MagicBlock components.
+    if (process.env.RUN_ER_TESTS !== "1") {
+        console.log("\n[skip] ER tests: set RUN_ER_TESTS=1 to run flappy_comprehensive.ts\n");
+        return;
+    }
     // Base layer setup
     const baseConnection = new Connection(BASE_LAYER_URL, "confirmed");
     const provider = anchor.AnchorProvider.env();

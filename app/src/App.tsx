@@ -24,7 +24,7 @@ export function App() {
           </main>
 
           <footer className="text-center mt-4 text-gray-500 text-sm">
-            <p>MagicBlock • Anchor • Solana • Low Latency</p>
+            <p>MagicBlock + Anchor + Solana • 10ms Latency</p>
           </footer>
         </div>
       </div>

@@ -205,12 +205,14 @@ export function useOnChainFlappyBird() {
     // Session Key Manager for seamless transactions on devnet
     // This enables auto-approval of transactions after initial session creation
     // gum-react-sdk can crash when wallet.publicKey is null on first render.
-    // Provide a stable dummy publicKey until the wallet connects.
+    // Provide a stable dummy keypair until the wallet connects.
+    const [dummyKeypair] = useState(() => Keypair.generate());
+    
     const sessionWallet = useSessionKeyManager(
-        ({
+        wallet.publicKey ? wallet : {
             ...wallet,
-            publicKey: wallet.publicKey ?? new PublicKey("11111111111111111111111111111111"),
-        } as any),
+            publicKey: dummyKeypair.publicKey,
+        } as any,
         connection,
         "devnet"
     );
@@ -435,6 +437,8 @@ export function useOnChainFlappyBird() {
         };
         fetchERState();
 
+        console.log("[ER] Setting up WebSocket subscription for:", gamePubkey.toBase58());
+        
         const subscriptionId = erConnection.onAccountChange(
             gamePubkey,
             async (accountInfo) => {
@@ -444,13 +448,16 @@ export function useOnChainFlappyBird() {
                     console.log("[ER] State update - status:", parsed.gameStatus, "score:", parsed.score, "birdY:", parsed.birdY / 1000);
                     setErGameAccount(parsed);
                 } catch (err) {
-                    console.error("Failed to decode ER account data:", err);
+                    console.error("[ER] Failed to decode account data:", err);
                 }
             },
             "confirmed"
         );
 
+        console.log("[ER] WebSocket subscription active, id:", subscriptionId);
+
         return () => {
+            console.log("[ER] Cleaning up WebSocket subscription:", subscriptionId);
             erConnection.removeAccountChangeListener(subscriptionId);
         };
     }, [erProgram, gamePubkey, erConnection, delegationStatus, parseGameAccount]);
